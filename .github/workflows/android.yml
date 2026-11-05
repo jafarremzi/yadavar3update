@@ -1,0 +1,155 @@
+name: Android CI
+
+on:
+  push:
+    branches: [ main, develop ]
+    tags: [ 'v*' ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      # ubuntu-latest از قبل Android SDK دارد (ANDROID_HOME)؛ نیازی به setup-android نیست
+      - name: Prepare Android SDK
+        run: |
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          # خروجی 141 (SIGPIPE) از yes عادی است و نباید job را شکست بدهد
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" "platforms;android-35" "build-tools;34.0.0" "platform-tools"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Make Gradle wrapper executable
+        run: chmod +x ./gradlew
+
+      - name: Unit tests
+        run: ./gradlew testDebugUnitTest --stacktrace
+
+      - name: Lint (advisory)
+        continue-on-error: true
+        run: ./gradlew lintDebug --stacktrace
+
+      - name: Build Debug APK
+        run: ./gradlew assembleDebug --stacktrace
+
+      - name: Verify APK exists
+        run: |
+          APK=$(find app/build/outputs/apk/debug -name "*.apk" | head -n 1)
+          test -n "$APK" || { echo "APK not found"; exit 1; }
+          ls -lh "$APK"
+          cp "$APK" YadAvar-debug.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: YadAvar-debug-apk
+          path: YadAvar-debug.apk
+          if-no-files-found: error
+
+      # کلید امضا را از Secretها می‌سازد و قبل از Gradle با keytool بررسی می‌کند،
+      # تا به‌جای خطای مبهم Gradle علت دقیق مشکل Secretها دیده شود.
+      - name: Prepare release signing key
+        id: signing
+        if: github.event_name != 'pull_request'
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+        run: |
+          set +e
+          JKS="$RUNNER_TEMP/release.jks"
+          IS_TAG="${{ startsWith(github.ref, 'refs/tags/v') }}"
+          fail() {
+            echo "::error::$1"
+            echo "use_release_key=false" >> "$GITHUB_OUTPUT"
+            if [ "$IS_TAG" = "true" ]; then
+              echo "برای انتشار با Tag امضای Release الزامی است؛ مشکل Secretها را برطرف کنید."
+              exit 1
+            fi
+            echo "::warning::Release این بار با کلید دیباگ امضا می‌شود (فقط برای نصب مستقیم)."
+            exit 0
+          }
+          [ -n "$KEYSTORE_BASE64" ]  || fail "Secret با نام KEYSTORE_BASE64 خالی یا تنظیم‌نشده است."
+          [ -n "$KEYSTORE_PASSWORD" ] || fail "Secret با نام KEYSTORE_PASSWORD خالی یا تنظیم‌نشده است."
+          [ -n "$KEY_ALIAS" ]        || fail "Secret با نام KEY_ALIAS خالی یا تنظیم‌نشده است (نام باید دقیقاً همین باشد)."
+
+          printf '%s' "$KEYSTORE_BASE64" | tr -d ' \r\n' | base64 -d > "$JKS" 2>/dev/null
+          echo "اندازه فایل keystore ساخته‌شده: $(wc -c < "$JKS") بایت"
+          [ -s "$JKS" ] || fail "محتوای KEYSTORE_BASE64 base64 معتبر نیست یا خالی است."
+
+          if keytool -list -keystore "$JKS" -storepass "$KEYSTORE_PASSWORD" > "$RUNNER_TEMP/kt.log" 2>&1; then
+            if keytool -list -keystore "$JKS" -storepass "$KEYSTORE_PASSWORD" -alias "$KEY_ALIAS" > /dev/null 2>&1; then
+              echo "keystore و alias معتبر هستند."
+              echo "use_release_key=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "aliasهای موجود در keystore:"
+              grep -E "PrivateKeyEntry|trustedCertEntry" "$RUNNER_TEMP/kt.log" | cut -d, -f1
+              fail "alias داده‌شده در KEY_ALIAS داخل keystore وجود ندارد (یکی از aliasهای بالا را بگذارید)."
+            fi
+          else
+            grep -iE "error|exception|invalid" "$RUNNER_TEMP/kt.log" | head -3
+            fail "keystore خوانده نشد: یا KEYSTORE_BASE64 خراب/ناقص است (باید خروجی base64 کل فایل .jks باشد) یا KEYSTORE_PASSWORD اشتباه است."
+          fi
+
+      - name: Build Release APK
+        if: github.event_name != 'pull_request'
+        env:
+          KEYSTORE_PATH: ${{ steps.signing.outputs.use_release_key == 'true' && format('{0}/release.jks', runner.temp) || '' }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: ./gradlew assembleRelease --stacktrace
+
+      - name: Upload Release APK
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: YadAvar-release-apk
+          path: app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-reports
+          path: |
+            app/build/reports/
+            app/build/test-results/
+          if-no-files-found: ignore
+
+  release:
+    # فقط با Tag مثل v1.0.0 و فقط پس از موفقیت کامل build و تست‌ها
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: YadAvar-release-apk
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: "*.apk"
+          generate_release_notes: true
